@@ -11,8 +11,11 @@ then
 fi
 if param compare -s ADC_ADS1115_EN 1
 then
-	ads1115 start -X
+	# Wait for ADS1115 power-on stabilization (~25ms typical)
+	usleep 100000
+	ads1115 start -X -b 3
 	board_adc start -n
+	flex_sensor start
 else
 	board_adc start
 fi

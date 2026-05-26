@@ -126,7 +126,7 @@ private:
 
 	uORB::PublicationMulti<adc_report_s> _to_adc_report{ORB_ID(adc_report)};
 
-	static const hrt_abstime SAMPLE_INTERVAL{50_ms};
+	static const hrt_abstime SAMPLE_INTERVAL{20_ms};
 
 	adc_report_s _adc_report{};
 

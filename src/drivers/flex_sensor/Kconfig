@@ -1,0 +1,6 @@
+menuconfig DRIVERS_FLEX_SENSOR
+	bool "flex_sensor (ADS1115 I2C ADC)"
+	default n
+	---help---
+		Enable driver for flex sensors connected via ADS1115 16-bit I2C ADC.
+		Publishes voltage and estimated flex angle on the flex_sensor uORB topic.

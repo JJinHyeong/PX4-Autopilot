@@ -40,4 +40,4 @@
  * @reboot_required true
  * @group Sensors
  */
-PARAM_DEFINE_INT32(ADC_ADS1115_EN, 0);
+PARAM_DEFINE_INT32(ADC_ADS1115_EN, 1);
