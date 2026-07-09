@@ -9,16 +9,14 @@ if mft query -q -k MFT -s MFT_PM2 -v 0
 then
 	set HAVE_PM2 no
 fi
-if param compare -s ADC_ADS1115_EN 1
-then
-	# Wait for ADS1115 power-on stabilization (~25ms typical)
-	usleep 100000
-	ads1115 start -X -b 3
-	board_adc start -n
-	flex_sensor start
-else
-	board_adc start
-fi
+board_adc start
+
+# Nitto/Bend Labs 2-axis flex sensors (4 sensors, I2C bus 3, addr 0x13~0x16)
+usleep 100000
+flex_sensor start -X -b 3 -a 0x13 -2   # Sensor 1 [0x13]
+flex_sensor start -X -b 3 -a 0x14 -2   # Sensor 2 [0x14]
+flex_sensor start -X -b 3 -a 0x15 -2   # Sensor 3 [0x15]
+flex_sensor start -X -b 3 -a 0x16 -2   # Sensor 4 [0x16]
 
 
 if param compare SENS_EN_INA226 1

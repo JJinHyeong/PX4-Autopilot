@@ -32,73 +32,81 @@
  ****************************************************************************/
 
 /**
- * Flex sensor 0 (AIN0) raw ADC value at flat (0 degrees)
- *
+ * Flex Sensor 1 (0x13) Axis1 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_FLAT0, 11600);
+PARAM_DEFINE_FLOAT(FLEX_S1_A1_OFF, 0.f);
 
 /**
- * Flex sensor 0 (AIN0) raw ADC value at 90 degrees bend
- *
+ * Flex Sensor 1 (0x13) Axis2 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_90D0, 9180);
+PARAM_DEFINE_FLOAT(FLEX_S1_A2_OFF, 0.f);
 
 /**
- * Flex sensor 1 (AIN1) raw ADC value at flat (0 degrees)
- *
+ * Flex Sensor 2 (0x14) Axis1 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_FLAT1, 11114);
+PARAM_DEFINE_FLOAT(FLEX_S2_A1_OFF, 0.f);
 
 /**
- * Flex sensor 1 (AIN1) raw ADC value at 90 degrees bend
- *
+ * Flex Sensor 2 (0x14) Axis2 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_90D1, 8550);
+PARAM_DEFINE_FLOAT(FLEX_S2_A2_OFF, 0.f);
 
 /**
- * Flex sensor 2 (AIN2) raw ADC value at flat (0 degrees)
- *
+ * Flex Sensor 3 (0x15) Axis1 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_FLAT2, 10701);
+PARAM_DEFINE_FLOAT(FLEX_S3_A1_OFF, 0.f);
 
 /**
- * Flex sensor 2 (AIN2) raw ADC value at 90 degrees bend
- *
+ * Flex Sensor 3 (0x15) Axis2 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_90D2, 8206);
+PARAM_DEFINE_FLOAT(FLEX_S3_A2_OFF, 0.f);
 
 /**
- * Flex sensor 3 (AIN3) raw ADC value at flat (0 degrees)
- *
+ * Flex Sensor 4 (0x16) Axis1 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_FLAT3, 11354);
+PARAM_DEFINE_FLOAT(FLEX_S4_A1_OFF, 0.f);
 
 /**
- * Flex sensor 3 (AIN3) raw ADC value at 90 degrees bend
- *
+ * Flex Sensor 4 (0x16) Axis2 zero offset
+ * @unit deg
+ * @min -105.0
+ * @max  105.0
+ * @decimal 2
  * @group Flex Sensor
- * @min 0
- * @max 32767
  */
-PARAM_DEFINE_INT32(FLEX_CAL_90D3, 8963);
+PARAM_DEFINE_FLOAT(FLEX_S4_A2_OFF, 0.f);

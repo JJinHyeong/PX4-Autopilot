@@ -31,184 +31,552 @@
  *
  ****************************************************************************/
 
+/**
+ * @file FlexSensor.cpp
+ *
+ * ■ 센서 통신 프로토콜 요약
+ * ─────────────────────────────────────────────────────────
+ * [초기화 시퀀스]
+ *   1. RESET  커맨드 전송 → 50ms 대기  (센서 내부 재초기화)
+ *   2. GET_DEV_ID 전송   → 2ms 후 5바이트 읽기 (1축/2축 판별)
+ *   3. SPS 커맨드 전송   → 100Hz 샘플레이트 설정
+ *   4. ADS_RUN 활성화    → 연속 출력 모드 시작
+ *
+ * [데이터 읽기 - Free Run Mode]
+ *   커맨드 전송 없이 5바이트 읽기:
+ *   (센서가 100Hz로 지속 갱신, 읽을 때 최신 샘플 반환)
+ *   1. 5바이트 읽기:
+ *      buf[0] = 패킷 타입 (0x00 = 각도 데이터)
+ *      buf[1] = Axis1 LSB  ┐ little-endian int16
+ *      buf[2] = Axis1 MSB  ┘ → raw1 / 32.0 = 각도(°)
+ *      buf[3] = Axis2 LSB  ┐
+ *      buf[4] = Axis2 MSB  ┘ → raw2 / 32.0 = 각도(°)
+ *
+ * ■ Raw 값 의미
+ * ─────────────────────────────────────────────────────────
+ *   raw는 센서가 내부적으로 출력하는 int16 카운트 값
+ *   전압이 아닌 정전용량을 디지털화한 값
+ *   각도(°) = raw / 32.0  (공식 BendLabs 코드 기준)
+ *   예) raw1 = 2880 → 2880 / 32.0 = 90.0°
+ *       raw1 = -2880 → -90.0° (반대 방향)
+ *       raw1 = 0     → 0° (파워온 기준 위치)
+ *
+ * ■ 상태(State) 분류 기준
+ * ─────────────────────────────────────────────────────────
+ *   STATE_FLAT  (0): 두 축 모두 3° 미만  → 평평한 상태
+ *   STATE_BENT  (1): 한 축이 3° 이상     → 한 방향으로 굽힘
+ *   STATE_TWIST (2): 두 축 모두 10° 초과 → 두 방향 동시 굽힘(뒤틀림)
+ */
+
 #include "FlexSensor.hpp"
 #include <px4_platform_common/log.h>
+#include <px4_platform_common/getopt.h>
+#include <px4_platform_common/module.h>
+#include <px4_platform_common/px4_work_queue/WorkQueueManager.hpp>
 
-FlexSensor::FlexSensor() :
-	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::hp_default),
-	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")),
-	_no_data_perf(perf_alloc(PC_COUNT,   MODULE_NAME": no_adc_data"))
+volatile uint8_t FlexSensor::_zero_mask = 0;
+
+static inline float median3(float a, float b, float c)
 {
+	if (a > b) { float t = a; a = b; b = t; }
+	if (b > c) { float t = b; b = c; c = t; }
+	if (a > b) { float t = a; a = b; b = t; }
+	return b;
+}
+
+
+FlexSensor::FlexSensor(const I2CSPIDriverConfig &config) :
+	I2C(config),
+	I2CSPIDriver(config),
+	_loop_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": cycle")),
+	_err_perf(perf_alloc(PC_COUNT,   MODULE_NAME": i2c_err")),
+	_is_2axis(config.custom1 == 1)   /* -2 플래그로 강제 2축 지정 가능 */
+{
+	_scale = _is_2axis ? ADS_SCALE_2AXIS : ADS_SCALE_1AXIS;
 }
 
 FlexSensor::~FlexSensor()
 {
-	ScheduleClear();
+	/* 소멸 시 연속 출력 모드 정지 */
+	uint8_t stop[ADS_TX_SIZE] = {ADS_CMD_RUN, 0x00};
+	send_cmd(stop, sizeof(stop));
+
 	perf_free(_loop_perf);
-	perf_free(_no_data_perf);
+	perf_free(_err_perf);
 }
 
-bool FlexSensor::init()
+/* ----------------------------------------------------------------
+ * send_cmd : I²C 커맨드 전송 (쓰기 전용)
+ * buf[0] = 커맨드 바이트, buf[1..] = 파라미터
+ * ---------------------------------------------------------------- */
+int FlexSensor::send_cmd(const uint8_t *buf, uint8_t len)
 {
-	static const char *flat_names[FLEX_NUM_CHANNELS] = {
-		"FLEX_CAL_FLAT0", "FLEX_CAL_FLAT1", "FLEX_CAL_FLAT2", "FLEX_CAL_FLAT3"
+	int ret = transfer(buf, len, nullptr, 0);
+
+	if (ret != PX4_OK) {
+		perf_count(_err_perf);
+	}
+
+	return ret;
+}
+
+/* ----------------------------------------------------------------
+ * read_data : I²C 데이터 수신 (읽기 전용)
+ * 커맨드 없이 센서에서 바로 len 바이트 읽기
+ * ---------------------------------------------------------------- */
+int FlexSensor::read_data(uint8_t *buf, uint8_t len)
+{
+	int ret = transfer(nullptr, 0, buf, len);
+
+	if (ret != PX4_OK) {
+		perf_count(_err_perf);
+	}
+
+	return ret;
+}
+
+/* ----------------------------------------------------------------
+ * get_device_id : 센서 종류 식별
+ *   커맨드 0x0A 전송 (5바이트 프레임) → 2ms 후 5바이트 응답
+ *   응답 buf[0] = 0x02 (DEV_ID 패킷 타입)
+ *   응답 buf[1] = 디바이스 ID
+ *     1  → 1축 v1
+ *     12 → 1축 v2
+ *     2  → 2축 v1
+ *     22 → 2축 v2 (Nitto)
+ * ---------------------------------------------------------------- */
+int FlexSensor::get_device_id(uint8_t &dev_id)
+{
+	uint8_t cmd[ADS_TX_SIZE] = {ADS_CMD_GET_DEV_ID};
+
+	if (send_cmd(cmd, sizeof(cmd)) != PX4_OK) {
+		return -EIO;
+	}
+
+	px4_usleep(2000);  /* 센서가 커맨드를 처리할 때까지 대기 */
+
+	uint8_t buf[5] = {};  /* 공식 코드: ADS_TRANSFER_SIZE=5바이트 읽기 */
+
+	if (read_data(buf, sizeof(buf)) != PX4_OK) {
+		return -EIO;
+	}
+
+	if (buf[0] != ADS_PKT_DEV_ID) {
+		PX4_WARN("unexpected DEV_ID pkt type 0x%02X (expected 0x02)", buf[0]);
+	}
+
+	dev_id = buf[1];
+	return PX4_OK;
+}
+
+/* ----------------------------------------------------------------
+ * init : 센서 초기화 시퀀스
+ *   I2C 버스 초기화 → RESET → GET_DEV_ID → SPS 설정 → RUN 활성화
+ * ---------------------------------------------------------------- */
+int FlexSensor::init()
+{
+	/* 1단계: I²C 버스 및 슬레이브 주소 초기화 */
+	int ret = I2C::init();
+
+	if (ret != PX4_OK) {
+		PX4_ERR("I2C init failed (%d) bus %d addr 0x%02X",
+			ret, get_device_bus(), get_device_address());
+		return ret;
+	}
+
+	uint8_t rst[ADS_TX_SIZE] = {ADS_CMD_RESET};
+
+	if (send_cmd(rst, sizeof(rst)) != PX4_OK) {
+		PX4_ERR("RESET failed bus %d addr 0x%02X",
+			get_device_bus(), get_device_address());
+		return -EIO;
+	}
+
+	px4_usleep(50000);
+
+	if (get_device_id(_dev_id) == PX4_OK) {
+		switch (_dev_id) {
+		case ADS_DEV_1AXIS:
+		case ADS_DEV_1AXIS_V2:
+			if (!_is_2axis) { _scale = ADS_SCALE_1AXIS; }
+
+			PX4_INFO("1-axis sensor detected (dev_id=%u)", _dev_id);
+			break;
+
+		case ADS_DEV_2AXIS:
+		case ADS_DEV_2AXIS_V2:
+			_is_2axis = true;
+			_scale    = ADS_SCALE_2AXIS;
+			PX4_INFO("2-axis sensor detected (dev_id=%u)", _dev_id);
+			break;
+
+		default:
+			PX4_WARN("unknown dev_id=%u, using %s mode", _dev_id, _is_2axis ? "2-axis" : "1-axis");
+			break;
+		}
+
+	} else {
+		PX4_WARN("DEV_ID read failed, using %s mode", _is_2axis ? "2-axis" : "1-axis");
+	}
+
+	uint8_t sps[ADS_TX_SIZE] = {
+		ADS_CMD_SPS,
+		(uint8_t)(ADS_SPS_100HZ & 0xFF),
+		(uint8_t)((ADS_SPS_100HZ >> 8) & 0xFF)
 	};
-	static const char *deg90_names[FLEX_NUM_CHANNELS] = {
-		"FLEX_CAL_90D0", "FLEX_CAL_90D1", "FLEX_CAL_90D2", "FLEX_CAL_90D3"
-	};
 
-	for (unsigned i = 0; i < FLEX_NUM_CHANNELS; i++) {
-		_ph_flat[i]  = param_find(flat_names[i]);
-		_ph_90deg[i] = param_find(deg90_names[i]);
+	if (send_cmd(sps, sizeof(sps)) != PX4_OK) {
+		PX4_WARN("SPS set failed");
 	}
 
-	update_params();
-	ScheduleOnInterval(FLEX_POLL_INTERVAL_US);
-	return true;
+	px4_usleep(5000);
+
+	uint8_t run_en[ADS_TX_SIZE] = {ADS_CMD_RUN, 0x01};
+
+	if (send_cmd(run_en, sizeof(run_en)) != PX4_OK) {
+		PX4_ERR("RUN mode failed");
+		return -EIO;
+	}
+
+	px4_usleep(5000);
+
+	PX4_INFO("init OK bus %d addr 0x%02X %s 100Hz",
+		 get_device_bus(), get_device_address(),
+		 _is_2axis ? "2-axis" : "1-axis");
+
+	_sensor_idx = (int)(get_device_address() - ADS_DEFAULT_ADDR);
+
+	if (_sensor_idx < 0 || _sensor_idx > 3) { _sensor_idx = 0; }
+
+	char pname[16];
+	snprintf(pname, sizeof(pname), "FLEX_S%d_A1_OFF", _sensor_idx + 1);
+	_param_axis1_off = param_find(pname);
+	snprintf(pname, sizeof(pname), "FLEX_S%d_A2_OFF", _sensor_idx + 1);
+	_param_axis2_off = param_find(pname);
+
+	/* Auto-zero on startup: sensor is in a fixed mount so boot position is
+	 * always the neutral reference. Zeroed on the first RunImpl call. */
+	_zero_mask |= (uint8_t)(1u << _sensor_idx);
+
+	ScheduleOnInterval(ADS_POLL_US);  /* 10ms 주기로 RunImpl 호출 (100Hz) */
+	return PX4_OK;
 }
 
-void FlexSensor::update_params()
+/* ----------------------------------------------------------------
+ * RunImpl : 10ms(100Hz)마다 호출되는 데이터 수집 루틴
+ *
+ * [동작 순서]
+ *   1. 5바이트 읽기      → [패킷타입 | A1_L A1_H | A2_L A2_H]
+ *      (연속 출력 모드: 센서가 100Hz로 계속 갱신, 별도 요청 불필요)
+ *   2. 파싱 및 변환      → raw / 32.0 = 각도(°)
+ *   3. 합성값 계산       → total, direction
+ *   4. 상태 분류         → FLAT / BENT / TWIST
+ *   5. uORB 발행         → flex_sensor 토픽
+ * ---------------------------------------------------------------- */
+void FlexSensor::RunImpl()
 {
-	for (unsigned i = 0; i < FLEX_NUM_CHANNELS; i++) {
-		if (_ph_flat[i] != PARAM_INVALID) {
-			param_get(_ph_flat[i], &_raw_flat[i]);
-		}
-
-		if (_ph_90deg[i] != PARAM_INVALID) {
-			param_get(_ph_90deg[i], &_raw_90deg[i]);
-		}
-
-		if (_raw_flat[i] == _raw_90deg[i]) {
-			PX4_WARN("FLEX ch%u: CAL_FLAT == CAL_90DEG, resetting to defaults", i);
-			_raw_flat[i]  = FLEX_CAL_FLAT_DEFAULT;
-			_raw_90deg[i] = FLEX_CAL_90DEG_DEFAULT;
-		}
-	}
-}
-
-void FlexSensor::Run()
-{
-	if (should_exit()) {
-		ScheduleClear();
-		exit_and_cleanup();
-		return;
-	}
-
 	perf_begin(_loop_perf);
 
-	adc_report_s adc{};
+	/* ── Step 1: 5바이트 응답 읽기 ── */
+	uint8_t buf[5] = {};
+	const uint8_t rlen = _is_2axis ? 5u : 3u;
 
-	if (!_adc_sub.update(&adc)) {
-		perf_count(_no_data_perf);
+	if (read_data(buf, rlen) != PX4_OK) {
 		perf_end(_loop_perf);
 		return;
 	}
 
-	flex_sensor_s report{};
-	report.timestamp = hrt_absolute_time();
-	report.device_id = adc.device_id;
+	/* 디버그: raw 바이트 출력 (문제 진단용) */
+	PX4_DEBUG("raw[%02X %02X %02X %02X %02X]",
+		  buf[0], buf[1], buf[2], buf[3], buf[4]);
 
-	for (unsigned i = 0; i < FLEX_NUM_CHANNELS; i++) {
-		if (adc.channel_id[i] < 0) {
-			continue;
-		}
-
-		const int32_t raw     = adc.raw_data[i];
-		const float   voltage = (float)raw * (ADS1115_V_REF / (float)ADS1115_RESOLUTION);
-
-		float bend_pct = (float)(_raw_flat[i] - raw) / (float)(_raw_flat[i] - _raw_90deg[i]) * 100.0f;
-
-		if (bend_pct < 0.0f)   { bend_pct = 0.0f; }
-		if (bend_pct > 100.0f) { bend_pct = 100.0f; }
-
-		report.raw_adc[i]        = raw;
-		report.voltage_v[i]      = voltage;
-		report.bend_pct[i]       = bend_pct;
-		report.flex_angle_deg[i] = bend_pct * 0.9f;
-
-		_last_raw[i]      = raw;
-		_last_voltage[i]  = voltage;
-		_last_bend_pct[i] = bend_pct;
-		_last_angle[i]    = bend_pct * 0.9f;
+	/* ── Step 2: 패킷 타입 확인 ──
+	 * buf[0] == 0x00 이어야 각도 데이터 패킷 */
+	if (buf[0] != ADS_PKT_SAMPLE) {
+		PX4_WARN("unexpected pkt type 0x%02X", buf[0]);
+		perf_end(_loop_perf);
+		return;
 	}
 
+	/* ── Step 3: raw 카운트 파싱 (little-endian int16) ──
+	 *
+	 * 바이트 레이아웃:
+	 *   buf[1]=LSB, buf[2]=MSB → Axis1
+	 *   buf[3]=LSB, buf[4]=MSB → Axis2
+	 *
+	 * 예) buf = [0x00, 0xC0, 0x0A, 0x20, 0xFF]
+	 *   raw1 = 0x0AC0 = 2752 → 2752 / 32.0 = 86.0°
+	 *   raw2 = 0xFF20 = -224 → -224 / 32.0 = -7.0°
+	 */
+	int16_t raw1 = (int16_t)((uint16_t)buf[2] << 8 | buf[1]);
+	int16_t raw2 = _is_2axis ? (int16_t)((uint16_t)buf[4] << 8 | buf[3]) : 0;
+
+	float axis1 = (float)raw1 * _scale;  /* 각도 변환: raw / 32.0 (= raw × 0.03125°/LSB) */
+	float axis2 = (float)raw2 * _scale;
+
+	/* 물리적으로 불가능한 값 즉시 폐기 (센서 최대 ±105°, 여유 5° 포함) */
+	if (fabsf(axis1) > ADS_RANGE_DEG || fabsf(axis2) > ADS_RANGE_DEG) {
+		perf_count(_err_perf);
+		perf_end(_loop_perf);
+		return;
+	}
+
+	/* ── zero 명령 처리 (flex_sensor zero 로 요청됨) ──
+	 * 현재 raw 각도를 오프셋으로 저장 → 이후부터 이 자세가 0° 기준 */
+	uint8_t bit = (uint8_t)(1u << _sensor_idx);
+
+	if (_zero_mask & bit) {
+		_zero_mask &= ~bit;
+		param_set(_param_axis1_off, &axis1);
+		param_set(_param_axis2_off, &axis2);
+		/* Reset filter state so the median buffer reinitializes from ~0 deg
+		 * instead of carrying over pre-zero values. */
+		_last_axis1 = 0.0f;
+		_last_axis2 = 0.0f;
+		for (int k = 0; k < ADS_MEDIAN_N; k++) { _hist1[k] = 0.0f; _hist2[k] = 0.0f; }
+		_hist_idx   = 0;
+		_read_count = 0;
+		PX4_INFO("Sensor %d [0x%02X] zeroed: A1=%.2f A2=%.2f deg saved",
+			 _sensor_idx + 1, get_device_address(),
+			 (double)axis1, (double)axis2);
+	}
+
+	/* ── Apply zero offset (FLEX_SN_A1_OFF / FLEX_SN_A2_OFF params) ── */
+	float off1 = 0.0f, off2 = 0.0f;
+	param_get(_param_axis1_off, &off1);
+	param_get(_param_axis2_off, &off2);
+	axis1 -= off1;
+	axis2 -= off2;
+
+	/* ── Median Filter N=3 ──────────────────────────────────────────
+	 * Circular buffer of last 3 samples. Returns middle value.
+	 * Removes single-sample I2C spikes with only 2-sample (20ms) lag. */
+	_hist1[_hist_idx] = axis1;
+	_hist2[_hist_idx] = axis2;
+	_hist_idx = (_hist_idx + 1) % ADS_MEDIAN_N;
+
+	if (_read_count >= (ADS_MEDIAN_N - 1)) {
+		axis1 = median3(_hist1[0], _hist1[1], _hist1[2]);
+		axis2 = median3(_hist2[0], _hist2[1], _hist2[2]);
+	}
+
+	/* ── Step 4: 합성값 계산 ──
+	 *
+	 * total     : 두 축의 벡터 합성 굽힘각
+	 *             센서가 어느 방향으로 얼마나 굽었는지 나타내는 크기
+	 *
+	 * direction : 굽힘 방향 (도 단위)
+	 *             0°  = Axis1 방향으로만 굽힘
+	 *             90° = Axis2 방향으로만 굽힘
+	 *             45° = 두 축 동일하게 굽힘
+	 */
+	const float total = sqrtf(axis1 * axis1 + axis2 * axis2);
+	const float dir   = atan2f(axis2, axis1) * (180.0f / M_PI_F);
+
+	/* 캐시 업데이트 (status 출력용) */
+	_last_raw1  = raw1;
+	_last_raw2  = raw2;
+	_last_axis1 = axis1;
+	_last_axis2 = axis2;
+	_last_total = total;
+	_last_dir   = dir;
+	_read_count++;
+
+	/* ── Step 5: 상태 분류 ──
+	 *
+	 * FLAT  (0): 완전히 평평한 상태
+	 *            두 축 모두 ADS_FLAT_THR_DEG(3°) 미만
+	 *
+	 * BENT  (1): 한 방향으로 굽힘
+	 *            한 축이 3° 이상이지만 두 축 모두 10° 초과는 아님
+	 *
+	 * TWIST (2): 두 방향 동시 굽힘 / 뒤틀림
+	 *            두 축 모두 ADS_TWIST_THR_DEG(10°) 초과
+	 */
+	/* ── Step 6: uORB 발행 ── */
+	flex_sensor_s report{};
+	report.timestamp     = hrt_absolute_time();
+	report.axis1_deg     = axis1;
+	report.axis2_deg     = axis2;
+	report.total_deg     = total;
+	report.direction_deg = dir;
+	report.raw_axis1     = raw1;
+	report.raw_axis2     = raw2;
 	_pub.publish(report);
+
+	/* MAVLink DEBUG_FLOAT_ARRAY 로 PC에 스트리밍
+	 * id = I2C 주소 (0x13=19, 0x14=20, 0x15=21, 0x16=22) 로 센서 구분 */
+	debug_array_s dbg{};
+	dbg.timestamp = report.timestamp;
+	dbg.id        = (uint16_t)get_device_address();
+	dbg.data[0]   = axis1;
+	dbg.data[1]   = axis2;
+	dbg.data[2]   = total;
+	dbg.data[3]   = dir;
+	_debug_pub.publish(dbg);
 
 	perf_end(_loop_perf);
 }
 
-int FlexSensor::print_status()
+/* ----------------------------------------------------------------
+ * set_device_addr : 센서 I²C 주소를 영구적으로 변경
+ *
+ * ADS_SET_ADDRESS(0x04) 커맨드를 센서에 전송하면 센서 내부 플래시에
+ * 새 주소가 저장되어 전원을 꺼도 유지된다.
+ *
+ * [사용 방법]
+ *   1. 변경할 센서 1개만 버스에 연결
+ *   2. flex_sensor set_addr -X -b 3 -a 0x13 0x14  실행
+ *   3. 전원을 껐다 켜서 새 주소(0x14)로 응답하는지 i2cdetect로 확인
+ * ---------------------------------------------------------------- */
+int FlexSensor::set_device_addr(uint8_t new_addr)
 {
-	ModuleBase::print_status();
-	PX4_INFO("ch    raw     volt(V)  bend%%   angle");
-	PX4_INFO("----  ------  -------  ------  ------");
-
-	for (unsigned i = 0; i < FLEX_NUM_CHANNELS; i++) {
-		PX4_INFO("AIN%u  %6d  %6.3f   %5.1f%%  %5.1fdeg",
-			 i, (int)_last_raw[i], (double)_last_voltage[i],
-			 (double)_last_bend_pct[i], (double)_last_angle[i]);
-	}
-
-	return 0;
+	uint8_t cmd[ADS_TX_SIZE] = {ADS_CMD_SET_ADDR, new_addr};
+	return send_cmd(cmd, sizeof(cmd));
 }
 
-int FlexSensor::task_spawn(int argc, char *argv[])
+/* ----------------------------------------------------------------
+ * print_status : 'flex_sensor status' 명령 출력
+ * ---------------------------------------------------------------- */
+void FlexSensor::print_status()
 {
-	FlexSensor *instance = new FlexSensor();
-
-	if (!instance) {
-		PX4_ERR("alloc failed");
-		return -1;
-	}
-
-	_object.store(instance);
-	_task_id = task_id_is_work_queue;
-
-	if (!instance->init()) {
-		delete instance;
-		_object.store(nullptr);
-		_task_id = -1;
-		return -1;
-	}
-
-	return 0;
+	I2CSPIDriverBase::print_status();
+	const int sensor_num = (int)(get_device_address() - ADS_DEFAULT_ADDR) + 1;
+	PX4_INFO("Sensor %d [0x%02X] ----------", sensor_num, get_device_address());
+	PX4_INFO("  type      : %s (dev_id=%u)", _is_2axis ? "2-axis" : "1-axis", _dev_id);
+	PX4_INFO("  reads     : %u", (unsigned)_read_count);
+	PX4_INFO("  Axis1     : %7.2f deg (raw=%d)", (double)_last_axis1, (int)_last_raw1);
+	PX4_INFO("  Axis2     : %7.2f deg (raw=%d)", (double)_last_axis2, (int)_last_raw2);
+	PX4_INFO("  Total     : %7.2f deg", (double)_last_total);
+	PX4_INFO("  Direction : %6.1f deg", (double)_last_dir);
+	float off1 = 0.0f, off2 = 0.0f;
+	param_get(_param_axis1_off, &off1);
+	param_get(_param_axis2_off, &off2);
+	PX4_INFO("  offset    : axis1=%.2f  axis2=%.2f deg", (double)off1, (double)off2);
+	perf_print_counter(_loop_perf);
+	perf_print_counter(_err_perf);
 }
 
-int FlexSensor::custom_command(int argc, char *argv[])
+void FlexSensor::print_usage()
 {
-	return print_usage("unknown command");
-}
-
-int FlexSensor::print_usage(const char *reason)
-{
-	if (reason) {
-		PX4_WARN("%s\n", reason);
-	}
-
 	PRINT_MODULE_DESCRIPTION(
 		R"DESCR_STR(
-### Description
-Flex sensor module. Reads AIN0-AIN3 from the ads1115 driver via adc_report
-and publishes bend angle and percentage for all 4 channels on the flex_sensor uORB topic.
+### Nitto/Bend Labs 2-axis Flex Sensor Driver
 
-Calibration parameters (per channel):
-  FLEX_CAL_FLATx  – raw ADC at flat (0 deg),  default 11600
-  FLEX_CAL_90Dx   – raw ADC at 90 degrees,     default 9180
+### [처음 설정 순서]
+  1) 센서 1개만 I2C 버스에 연결
+  2) flex_sensor set_addr -X -b 3 0x14   <- 0x13->0x14로 주소 변경
+  3) 전원 OFF->ON 후 i2cdetect -b 3 으로 확인
+  4) 나머지 센서도 같은 방법으로 0x15, 0x16으로 변경
+  5) 4개 모두 연결 후 flex_sensor status 로 동작 확인
 
-### Examples
-  flex_sensor start
-  flex_sensor stop
-  flex_sensor status
+### [영점 설정]
+  flex_sensor zero   <- 현재 자세를 0도 기준으로 저장 (모든 센서 동시)
+  param save         <- 재부팅 후에도 유지
+
+### [실시간 데이터 확인]
+  listener flex_sensor -i 0   # Sensor 1 [0x13]
+  listener flex_sensor -i 1   # Sensor 2 [0x14]
+  listener flex_sensor -i 2   # Sensor 3 [0x15]
+  listener flex_sensor -i 3   # Sensor 4 [0x16]
 )DESCR_STR");
 
 	PRINT_MODULE_USAGE_NAME("flex_sensor", "driver");
+	PRINT_MODULE_USAGE_SUBCATEGORY("flex_sensor");
 	PRINT_MODULE_USAGE_COMMAND("start");
+	PRINT_MODULE_USAGE_PARAMS_I2C_SPI_DRIVER(true, false);
+	PRINT_MODULE_USAGE_PARAM_FLAG('2', "Force 2-axis mode", true);
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
-
-	return 0;
+	PRINT_MODULE_USAGE_COMMAND_DESCR("zero", "Zero all sensors (run 'param save' to persist)");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("set_addr", "Change I2C address (connect 1 sensor only)");
+	PRINT_MODULE_USAGE_PARAM_FLAG('X', "External I2C bus", false);
+	PRINT_MODULE_USAGE_PARAM_INT('b', 3, 1, 4, "Bus number", false);
+	PRINT_MODULE_USAGE_PARAM_INT('a', 0x13, 0x08, 0x77, "Current address (auto-scan if omitted)", true);
+	PRINT_MODULE_USAGE_ARG("<new addr>", "New I2C address (e.g. 0x14)", false);
 }
 
 extern "C" __EXPORT int flex_sensor_main(int argc, char *argv[])
 {
-	return FlexSensor::main(argc, argv);
+	using ThisDriver = FlexSensor;
+	BusCLIArguments cli{true, false};
+	cli.i2c_address           = ADS_DEFAULT_ADDR;
+	cli.default_i2c_frequency = ADS_BUS_CLOCK_HZ;
+
+	int ch;
+
+	while ((ch = cli.getOpt(argc, argv, "2")) != EOF) {
+		switch (ch) {
+		case '2':
+			cli.custom1 = 1;  /* 2축 강제 지정 플래그 */
+			break;
+		}
+	}
+
+	const char *verb = cli.optArg();
+
+	if (!verb) {
+		ThisDriver::print_usage();
+		return -1;
+	}
+
+	BusInstanceIterator iterator(MODULE_NAME, cli, DRV_DEVTYPE_UNUSED);
+
+	if (!strcmp(verb, "start")) {
+		return ThisDriver::module_start(cli, iterator);
+
+	} else if (!strcmp(verb, "stop")) {
+		return ThisDriver::module_stop(iterator);
+
+	} else if (!strcmp(verb, "status")) {
+		return ThisDriver::module_status(iterator);
+
+	} else if (!strcmp(verb, "zero")) {
+		FlexSensor::request_zero();
+		PX4_INFO("Zero requested - applied in ~10ms");
+		PX4_INFO("Run 'param save' to persist across reboots");
+		return 0;
+
+	} else if (!strcmp(verb, "set_addr")) {
+		/* 마지막 인수 = 새 I²C 주소 */
+		uint8_t new_addr = (uint8_t)strtol(argv[argc - 1], nullptr, 0);
+
+		if (new_addr < 0x08 || new_addr > 0x77) {
+			PX4_ERR("Invalid address 0x%02X (valid: 0x08-0x77)", new_addr);
+			PX4_ERR("Usage: flex_sensor set_addr -X -b 3 [-a <cur>] <new>");
+			return -1;
+		}
+
+		if (!iterator.next()) {
+			PX4_ERR("No sensor found on bus - check wiring and connect only 1 sensor");
+			return -1;
+		}
+
+		I2CSPIDriverConfig config(cli, iterator, px4::wq_configurations::I2C1);
+		FlexSensor *dev = new FlexSensor(config);
+		int ret = dev->I2C::init();
+
+		if (ret != PX4_OK) {
+			PX4_ERR("Sensor not responding (bus %d addr 0x%02X) - check wiring",
+				config.bus, config.i2c_address);
+			delete dev;
+			return ret;
+		}
+
+		PX4_INFO("Sensor found: bus %d addr 0x%02X", config.bus, config.i2c_address);
+		ret = dev->set_device_addr(new_addr);
+		px4_usleep(10000);
+
+		if (ret == PX4_OK) {
+			PX4_INFO("Address changed: 0x%02X -> 0x%02X", config.i2c_address, new_addr);
+			PX4_INFO("Power cycle, then verify with 'i2cdetect -b %d'", config.bus);
+		} else {
+			PX4_ERR("Address change failed - check sensor connection");
+		}
+
+		delete dev;
+		return ret;
+	}
+
+	ThisDriver::print_usage();
+	return -1;
 }

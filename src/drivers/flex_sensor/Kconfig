@@ -1,6 +1,7 @@
 menuconfig DRIVERS_FLEX_SENSOR
-	bool "flex_sensor (ADS1115 I2C ADC)"
+	bool "flex_sensor (Nitto/Bend Labs ADS I2C)"
 	default n
 	---help---
-		Enable driver for flex sensors connected via ADS1115 16-bit I2C ADC.
-		Publishes voltage and estimated flex angle on the flex_sensor uORB topic.
+		Enable driver for Nitto/Bend Labs Angular Displacement Sensor (ADS)
+		connected via I2C. Default address 0x13. Supports 1-axis and 2-axis
+		sensors. Publishes flex_sensor uORB topic at 20 Hz.
