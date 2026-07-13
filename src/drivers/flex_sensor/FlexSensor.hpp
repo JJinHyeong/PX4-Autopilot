@@ -85,6 +85,7 @@
 #define ADS_CMD_INT_EN     0x05u  /* DRDY 인터럽트 활성화: [0x05, 0x01]=핀 활성 (공식명 ADS_INTERRUPT_ENABLE) */
 #define ADS_CMD_GET_DEV_ID 0x0Au  /* 디바이스 ID 요청: [0x0A, 0,0,0,0] → 5바이트 응답 */
 #define ADS_CMD_SET_ADDR   0x04u  /* I²C 주소 변경: [0x04, new_addr, 0, 0, 0] → 센서 플래시에 영구 저장 */
+#define ADS_CMD_SHUTDOWN   0x09u  /* 초저전력 대기: ~50nA, RESET으로만 복귀 가능 */
 
 /* ================================================================
  * 응답 패킷 타입 (수신 데이터의 buf[0])
@@ -141,7 +142,11 @@ public:
 	/* 영점 요청: flex_sensor zero 명령에서 호출 */
 	static void request_zero() { _zero_mask = 0x0F; }
 
+	/* SHUTDOWN 복구 테스트 요청: flex_sensor shutdown_test 명령에서 호출 */
+	static void request_shutdown_test() { _do_shutdown_test = true; }
+
 private:
+	void run_shutdown_test();
 	/* I²C 커맨드 전송 */
 	int send_cmd(const uint8_t *buf, uint8_t len);
 
@@ -188,4 +193,7 @@ private:
 	/* 영점 요청 마스크 (비트 0~3 = 센서 0~3)
 	 * flex_sensor zero 명령 시 해당 비트 세트 → 다음 RunImpl에서 처리 */
 	static volatile uint8_t _zero_mask;
+
+	/* SHUTDOWN 복구 테스트 플래그: RunImpl에서 once 실행 후 clear */
+	static volatile bool _do_shutdown_test;
 };

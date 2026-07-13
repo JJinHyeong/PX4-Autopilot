@@ -75,6 +75,7 @@
 #include <px4_platform_common/px4_work_queue/WorkQueueManager.hpp>
 
 volatile uint8_t FlexSensor::_zero_mask = 0;
+volatile bool    FlexSensor::_do_shutdown_test = false;
 
 static inline float median3(float a, float b, float c)
 {
@@ -161,8 +162,14 @@ int FlexSensor::get_device_id(uint8_t &dev_id)
 		return -EIO;
 	}
 
+	PX4_INFO("[0x%02X] DEV_ID raw: buf=[0x%02X 0x%02X 0x%02X 0x%02X 0x%02X]",
+		 get_device_address(), buf[0], buf[1], buf[2], buf[3], buf[4]);
+
 	if (buf[0] != ADS_PKT_DEV_ID) {
-		PX4_WARN("unexpected DEV_ID pkt type 0x%02X (expected 0x02)", buf[0]);
+		PX4_WARN("[0x%02X] buf[0]=0x%02X != 0x02 (SAMPLE 패킷으로 응답 - 타이밍 문제)",
+			 get_device_address(), buf[0]);
+	} else {
+		PX4_INFO("[0x%02X] buf[0]=0x02 OK, dev_id=%u", get_device_address(), buf[1]);
 	}
 
 	dev_id = buf[1];
@@ -276,6 +283,14 @@ int FlexSensor::init()
 void FlexSensor::RunImpl()
 {
 	perf_begin(_loop_perf);
+
+	/* SHUTDOWN 복구 테스트 요청 시 일회성 실행 (RunImpl 독점) */
+	if (_do_shutdown_test) {
+		_do_shutdown_test = false;
+		run_shutdown_test();
+		perf_end(_loop_perf);
+		return;
+	}
 
 	/* ── Step 1: 5바이트 응답 읽기 ── */
 	uint8_t buf[5] = {};
@@ -436,6 +451,157 @@ int FlexSensor::set_device_addr(uint8_t new_addr)
 }
 
 /* ----------------------------------------------------------------
+ * run_shutdown_test : SHUTDOWN(0x09)이 ADC freeze를 해제하는지 검증
+ *
+ * 테스트 순서:
+ *   1. 기준 5샘플  → 정상 스트리밍 확인 (값이 변해야 함)
+ *   2. SPS 재전송  → 스트리밍 중 SPS = ADC freeze 유발
+ *   3. 확인 5샘플  → freeze 확인 (값이 고정되어야 함)
+ *   4. SHUTDOWN    → 200ms 대기 (초저전력 모드)
+ *   5. RESET       → 100ms 대기 (NVRAM 복원 후 재시작)
+ *   6. 복구 5샘플  → 값이 다시 변하면 SHUTDOWN = 전원차단 동급
+ *   7. 재초기화    → 드라이버 정상 복귀
+ * ---------------------------------------------------------------- */
+void FlexSensor::run_shutdown_test()
+{
+	PX4_INFO("====================================================");
+	PX4_INFO("ADS SHUTDOWN Freeze-Recovery Test [addr 0x%02X]", get_device_address());
+	PX4_INFO("====================================================");
+
+	/* Step 1: 기준 5샘플 */
+	PX4_INFO("[1] Baseline (sensor should be streaming, values must vary):");
+	int16_t b1[5] = {}, b2[5] = {};
+
+	for (int i = 0; i < 5; i++) {
+		px4_usleep(15000);
+		uint8_t buf[5] = {};
+		read_data(buf, sizeof(buf));
+		b1[i] = (int16_t)((uint16_t)buf[2] << 8 | buf[1]);
+		b2[i] = (int16_t)((uint16_t)buf[4] << 8 | buf[3]);
+		PX4_INFO("    [%d] raw1=%-6d  raw2=%-6d  pkt=0x%02X", i, b1[i], b2[i], buf[0]);
+	}
+
+	bool base_constant = true;
+
+	for (int i = 1; i < 5; i++) {
+		if (b1[i] != b1[0] || b2[i] != b2[0]) { base_constant = false; break; }
+	}
+
+	PX4_INFO("    -> %s", base_constant ? "CONSTANT (sensor may already be frozen!)" : "VARYING (normal)");
+
+	if (base_constant) {
+		PX4_WARN("Cannot induce freeze on already-frozen sensor. Aborting test.");
+		return;
+	}
+
+	/* Step 2: SPS 재전송으로 ADC freeze 유발 */
+	PX4_INFO("[2] Sending SPS(100Hz) while streaming -> inducing ADC freeze...");
+	uint8_t sps[ADS_TX_SIZE] = {
+		ADS_CMD_SPS,
+		(uint8_t)(ADS_SPS_100HZ & 0xFF),
+		(uint8_t)((ADS_SPS_100HZ >> 8) & 0xFF)
+	};
+	send_cmd(sps, sizeof(sps));
+	px4_usleep(50000);
+
+	/* Step 3: freeze 확인 */
+	PX4_INFO("[3] Confirming freeze (all 5 samples must be identical):");
+	int16_t f1[5] = {}, f2[5] = {};
+
+	for (int i = 0; i < 5; i++) {
+		px4_usleep(15000);
+		uint8_t buf[5] = {};
+		read_data(buf, sizeof(buf));
+		f1[i] = (int16_t)((uint16_t)buf[2] << 8 | buf[1]);
+		f2[i] = (int16_t)((uint16_t)buf[4] << 8 | buf[3]);
+		PX4_INFO("    [%d] raw1=%-6d  raw2=%-6d", i, f1[i], f2[i]);
+	}
+
+	bool is_frozen = true;
+
+	for (int i = 1; i < 5; i++) {
+		if (f1[i] != f1[0] || f2[i] != f2[0]) { is_frozen = false; break; }
+	}
+
+	PX4_INFO("    -> %s", is_frozen ? "FROZEN (confirmed)" : "NOT FROZEN (test inconclusive)");
+
+	if (!is_frozen) {
+		PX4_WARN("Could not induce freeze. Possible causes:");
+		PX4_WARN("  - Sensor was power-cycled (started in IDLE, SPS in IDLE is safe)");
+		PX4_WARN("  - This Pixhawk test cannot simulate VOXL2 scenario unless sensor stays powered");
+		/* 재초기화 */
+		uint8_t idle[ADS_TX_SIZE] = {ADS_CMD_RUN, 0x00};
+		send_cmd(idle, sizeof(idle));
+		px4_usleep(50000);
+		send_cmd(sps, sizeof(sps));
+		px4_usleep(20000);
+		uint8_t run[ADS_TX_SIZE] = {ADS_CMD_RUN, 0x01};
+		send_cmd(run, sizeof(run));
+		return;
+	}
+
+	/* Step 4: SHUTDOWN */
+	PX4_INFO("[4] Sending SHUTDOWN (0x09)... waiting 200ms in ultra-low-power");
+	uint8_t shutdown_cmd[ADS_TX_SIZE] = {ADS_CMD_SHUTDOWN};
+	send_cmd(shutdown_cmd, sizeof(shutdown_cmd));
+	px4_usleep(200000);
+
+	/* Step 5: RESET으로 SHUTDOWN에서 깨우기 */
+	PX4_INFO("[5] Sending RESET to wake from SHUTDOWN... waiting 100ms");
+	uint8_t rst[ADS_TX_SIZE] = {ADS_CMD_RESET};
+	send_cmd(rst, sizeof(rst));
+	px4_usleep(100000);
+
+	/* Step 6: 복구 확인 */
+	PX4_INFO("[6] Sampling after SHUTDOWN+RESET:");
+	int16_t r1[5] = {}, r2[5] = {};
+
+	for (int i = 0; i < 5; i++) {
+		px4_usleep(15000);
+		uint8_t buf[5] = {};
+		read_data(buf, sizeof(buf));
+		r1[i] = (int16_t)((uint16_t)buf[2] << 8 | buf[1]);
+		r2[i] = (int16_t)((uint16_t)buf[4] << 8 | buf[3]);
+		PX4_INFO("    [%d] raw1=%-6d  raw2=%-6d  pkt=0x%02X", i, r1[i], r2[i], buf[0]);
+	}
+
+	bool still_frozen = true;
+
+	for (int i = 1; i < 5; i++) {
+		if (r1[i] != r1[0] || r2[i] != r2[0]) { still_frozen = false; break; }
+	}
+
+	bool recovered = !still_frozen;
+
+	/* Step 7: 재초기화 */
+	PX4_INFO("[7] Re-initializing sensor after test...");
+	uint8_t idle[ADS_TX_SIZE] = {ADS_CMD_RUN, 0x00};
+	send_cmd(idle, sizeof(idle));
+	px4_usleep(50000);
+	send_cmd(sps, sizeof(sps));
+	px4_usleep(20000);
+	uint8_t run[ADS_TX_SIZE] = {ADS_CMD_RUN, 0x01};
+	send_cmd(run, sizeof(run));
+	px4_usleep(20000);
+
+	PX4_INFO("====================================================");
+	PX4_INFO("RESULT:");
+	PX4_INFO("  Freeze induced        : YES");
+	PX4_INFO("  After SHUTDOWN+RESET  : %s", recovered ? "RECOVERED (values vary)" : "STILL FROZEN");
+
+	if (recovered) {
+		PX4_INFO("  >> CONCLUSION: SHUTDOWN IS equivalent to power cycle");
+		PX4_INFO("     VOXL2 init fix: SHUTDOWN(200ms) -> RESET(100ms) -> IDLE -> SPS -> RUN");
+	} else {
+		PX4_INFO("  >> CONCLUSION: SHUTDOWN does NOT clear ADC freeze");
+		PX4_INFO("     Only physical power cycle can recover. Hardware nRST line needed.");
+		PX4_WARN("  Sensor [0x%02X] remains frozen - power cycle required", get_device_address());
+	}
+
+	PX4_INFO("====================================================");
+}
+
+/* ----------------------------------------------------------------
  * print_status : 'flex_sensor status' 명령 출력
  * ---------------------------------------------------------------- */
 void FlexSensor::print_status()
@@ -534,6 +700,12 @@ extern "C" __EXPORT int flex_sensor_main(int argc, char *argv[])
 		FlexSensor::request_zero();
 		PX4_INFO("Zero requested - applied in ~10ms");
 		PX4_INFO("Run 'param save' to persist across reboots");
+		return 0;
+
+	} else if (!strcmp(verb, "shutdown_test")) {
+		FlexSensor::request_shutdown_test();
+		PX4_INFO("SHUTDOWN recovery test requested - running in next RunImpl (~10ms)");
+		PX4_INFO("Watch 'flex_sensor status' or syslog for results");
 		return 0;
 
 	} else if (!strcmp(verb, "set_addr")) {
