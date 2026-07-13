@@ -145,6 +145,9 @@ public:
 	/* SHUTDOWN 복구 테스트 요청: flex_sensor shutdown_test 명령에서 호출 */
 	static void request_shutdown_test() { _do_shutdown_test = true; }
 
+	/* I2C 버스 진단: 주소 스캔 + 단계별 init + 연속 샘플 출력 */
+	void diag();
+
 private:
 	void run_shutdown_test();
 	/* I²C 커맨드 전송 */

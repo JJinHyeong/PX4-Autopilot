@@ -434,6 +434,186 @@ void FlexSensor::RunImpl()
 }
 
 /* ----------------------------------------------------------------
+ * diag : I²C 버스 진단 루틴
+ *
+ * 1. 0x13~0x16 주소 스캔 (ACK 여부)
+ * 2. 발견된 각 주소에서 단계별 init 시퀀스 (각 단계 성공/실패 출력)
+ * 3. 20샘플 연속 읽기 (raw 바이트 + 각도 출력, freeze 판정)
+ *
+ * 사용: flex_sensor diag -X -b <bus>
+ *   버스를 여기서 지정하면 스캔 결과로 문제 원인을 좁힐 수 있다
+ * ---------------------------------------------------------------- */
+void FlexSensor::diag()
+{
+	static const uint8_t SCAN_ADDRS[4] = {0x13, 0x14, 0x15, 0x16};
+
+	PX4_INFO("════════════════════════════════════════════════════════");
+	PX4_INFO("  ADS Flex Sensor I2C Diagnostic  (bus %d)", get_device_bus());
+	PX4_INFO("════════════════════════════════════════════════════════");
+
+	/* ── 1. 주소 스캔 ── */
+	PX4_INFO("");
+	PX4_INFO("[SCAN] Probing 0x13 0x14 0x15 0x16 ...");
+	bool found[4] = {};
+
+	for (int i = 0; i < 4; i++) {
+		set_device_address(SCAN_ADDRS[i]);
+		uint8_t probe = 0;
+		found[i] = (transfer(nullptr, 0, &probe, 1) == PX4_OK);
+		PX4_INFO("  0x%02X : %s", SCAN_ADDRS[i], found[i] ? "ACK  <-- found" : "NACK");
+	}
+
+	int total_found = 0;
+
+	for (int i = 0; i < 4; i++) { if (found[i]) { total_found++; } }
+
+	PX4_INFO("  Found %d device(s) on bus %d", total_found, get_device_bus());
+
+	if (total_found == 0) {
+		PX4_ERR("");
+		PX4_ERR("[DIAG] Nothing found. Check:");
+		PX4_ERR("  1) Wiring - SDA/SCL/GND/3.3V");
+		PX4_ERR("  2) Bus number: try -b 1  -b 2  -b 3  -b 4");
+		PX4_ERR("  3) External bus flag: add -X for external connector");
+		PX4_ERR("  4) Pull-up resistors (4.7kOhm to 3.3V)");
+		PX4_ERR("  5) Power: sensor needs 3.3V (NOT 5V)");
+		return;
+	}
+
+	/* ── 2. 발견된 주소별 단계별 init ── */
+	for (int i = 0; i < 4; i++) {
+		if (!found[i]) { continue; }
+
+		PX4_INFO("");
+		PX4_INFO("[TEST] addr 0x%02X ─────────────────────────────────────", SCAN_ADDRS[i]);
+		set_device_address(SCAN_ADDRS[i]);
+
+		/* Step 1: RESET */
+		uint8_t rst[ADS_TX_SIZE] = {ADS_CMD_RESET};
+		bool rst_ok = (send_cmd(rst, sizeof(rst)) == PX4_OK);
+		PX4_INFO("  [1/5] RESET (0x02)        : %s", rst_ok ? "OK  (+50ms wait)" : "FAIL -- sensor not responding");
+
+		if (!rst_ok) {
+			PX4_WARN("        Scan passed but RESET failed -> pull-up issue or power glitch");
+			continue;
+		}
+
+		px4_usleep(50000);
+
+		/* Step 2: GET_DEV_ID */
+		uint8_t id_cmd[ADS_TX_SIZE] = {ADS_CMD_GET_DEV_ID};
+		bool id_cmd_ok = (send_cmd(id_cmd, sizeof(id_cmd)) == PX4_OK);
+		px4_usleep(2000);
+		uint8_t id_buf[5] = {};
+		bool id_rd_ok = (read_data(id_buf, sizeof(id_buf)) == PX4_OK);
+		const char *dev_name = "unknown";
+
+		if (id_rd_ok) {
+			switch (id_buf[1]) {
+			case  1: dev_name = "1-axis v1";         break;
+			case 12: dev_name = "1-axis v2";         break;
+			case  2: dev_name = "2-axis v1";         break;
+			case 22: dev_name = "2-axis v2 (Nitto)"; break;
+			}
+		}
+
+		PX4_INFO("  [2/5] GET_DEV_ID (0x0A)   : cmd=%s rd=%s  pkt=0x%02X dev_id=%u -> %s",
+			 id_cmd_ok ? "OK" : "FAIL", id_rd_ok ? "OK" : "FAIL",
+			 id_buf[0], id_buf[1], dev_name);
+
+		if (id_rd_ok && id_buf[0] != ADS_PKT_DEV_ID) {
+			PX4_WARN("        pkt=0x%02X expected 0x02 -- sensor already in streaming mode or timing off",
+				 id_buf[0]);
+		}
+
+		/* Step 3: SPS 100Hz */
+		uint8_t sps[ADS_TX_SIZE] = {
+			ADS_CMD_SPS,
+			(uint8_t)(ADS_SPS_100HZ & 0xFF),
+			(uint8_t)((ADS_SPS_100HZ >> 8) & 0xFF)
+		};
+		bool sps_ok = (send_cmd(sps, sizeof(sps)) == PX4_OK);
+		PX4_INFO("  [3/5] SPS 100Hz (0x01)    : %s", sps_ok ? "OK" : "FAIL");
+
+		/* Step 4: RUN ON */
+		uint8_t run[ADS_TX_SIZE] = {ADS_CMD_RUN, 0x01};
+		bool run_ok = (send_cmd(run, sizeof(run)) == PX4_OK);
+		PX4_INFO("  [4/5] RUN ON (0x00, 0x01) : %s  (+10ms for first sample)", run_ok ? "OK" : "FAIL");
+		px4_usleep(10000);
+
+		/* Step 5: 20샘플 연속 읽기 */
+		PX4_INFO("  [5/5] Continuous read (20 samples @ 10ms):");
+
+		int good = 0, bad_pkt = 0, rd_err = 0;
+		int16_t prev_r1 = 0, prev_r2 = 0;
+		bool data_frozen = true;
+
+		for (int s = 0; s < 20; s++) {
+			px4_usleep(10000);
+			uint8_t buf[5] = {};
+
+			if (read_data(buf, sizeof(buf)) != PX4_OK) {
+				PX4_INFO("         [%2d] READ FAIL", s);
+				rd_err++;
+				continue;
+			}
+
+			int16_t r1 = (int16_t)((uint16_t)buf[2] << 8 | buf[1]);
+			int16_t r2 = (int16_t)((uint16_t)buf[4] << 8 | buf[3]);
+
+			if (s > 0 && (r1 != prev_r1 || r2 != prev_r2)) { data_frozen = false; }
+
+			prev_r1 = r1;
+			prev_r2 = r2;
+
+			if (buf[0] == ADS_PKT_SAMPLE) {
+				float a1 = (float)r1 * ADS_SCALE_2AXIS;
+				float a2 = (float)r2 * ADS_SCALE_2AXIS;
+				PX4_INFO("         [%2d] pkt=0x00 raw1=%6d raw2=%6d  A1=%7.2f  A2=%7.2f deg",
+					 s, r1, r2, (double)a1, (double)a2);
+				good++;
+
+			} else {
+				PX4_WARN("         [%2d] pkt=0x%02X (not 0x00)  raw=[%02X %02X %02X %02X]",
+					 s, buf[0], buf[1], buf[2], buf[3], buf[4]);
+				bad_pkt++;
+			}
+		}
+
+		/* ── 결과 요약 ── */
+		PX4_INFO("");
+		PX4_INFO("  ── Result 0x%02X ──────────────────────────────────", SCAN_ADDRS[i]);
+		PX4_INFO("  good=%d  bad_pkt=%d  read_err=%d", good, bad_pkt, rd_err);
+
+		if (rd_err == 20) {
+			PX4_ERR("  FAIL: all reads failed after successful init");
+			PX4_ERR("        -> sensor entered auto-sleep?");
+			PX4_ERR("        -> try: flex_sensor start, then flex_sensor status");
+
+		} else if (good == 0) {
+			PX4_ERR("  FAIL: no valid samples (pkt type always wrong)");
+			PX4_ERR("        -> sensor firmware version mismatch?");
+
+		} else if (data_frozen && good >= 5) {
+			PX4_WARN("  WARNING: data frozen (values never changed)");
+			PX4_WARN("           -> SPS during streaming freezes ADC on some units");
+			PX4_WARN("           -> workaround: RESET -> RUN only (skip SPS)");
+
+		} else {
+			PX4_INFO("  PASS: sensor working correctly");
+		}
+	}
+
+	PX4_INFO("");
+	PX4_INFO("════════════════════════════════════════════════════════");
+	PX4_INFO("Next steps:");
+	PX4_INFO("  Working  -> flex_sensor start -X -b <bus> -a <addr>");
+	PX4_INFO("  Nothing  -> check bus number (try -b 1 through -b 4)");
+	PX4_INFO("  Frozen   -> rebuild without SPS cmd in init");
+	PX4_INFO("════════════════════════════════════════════════════════");
+}
+
+/* ----------------------------------------------------------------
  * set_device_addr : 센서 I²C 주소를 영구적으로 변경
  *
  * ADS_SET_ADDRESS(0x04) 커맨드를 센서에 전송하면 센서 내부 플래시에
@@ -654,6 +834,7 @@ void FlexSensor::print_usage()
 	PRINT_MODULE_USAGE_PARAM_FLAG('2', "Force 2-axis mode", true);
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 	PRINT_MODULE_USAGE_COMMAND_DESCR("zero", "Zero all sensors (run 'param save' to persist)");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("diag", "I2C bus scan + step-by-step init + 20-sample read test");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("set_addr", "Change I2C address (connect 1 sensor only)");
 	PRINT_MODULE_USAGE_PARAM_FLAG('X', "External I2C bus", false);
 	PRINT_MODULE_USAGE_PARAM_INT('b', 3, 1, 4, "Bus number", false);
@@ -706,6 +887,23 @@ extern "C" __EXPORT int flex_sensor_main(int argc, char *argv[])
 		FlexSensor::request_shutdown_test();
 		PX4_INFO("SHUTDOWN recovery test requested - running in next RunImpl (~10ms)");
 		PX4_INFO("Watch 'flex_sensor status' or syslog for results");
+		return 0;
+
+	} else if (!strcmp(verb, "diag")) {
+		/* 버스만 열면 되므로 iterator 실패는 무시하고 진행 */
+		iterator.next();
+		I2CSPIDriverConfig config(cli, iterator, px4::wq_configurations::I2C1);
+		FlexSensor *dev = new FlexSensor(config);
+
+		if (dev->I2C::init() != PX4_OK) {
+			PX4_ERR("Cannot open I2C bus %d", config.bus);
+			PX4_ERR("  -> check bus number: flex_sensor diag -X -b <1..4>");
+			delete dev;
+			return -1;
+		}
+
+		dev->diag();
+		delete dev;
 		return 0;
 
 	} else if (!strcmp(verb, "set_addr")) {
