@@ -123,7 +123,7 @@
 #define ADS_BUS_CLOCK_HZ   400000u  /* I²C Fast Mode (400 kHz) */
 #define ADS_TX_SIZE        5u       /* 2축 I²C 쓰기 프레임 크기 (공식 ADS_TRANSFER_SIZE) */
 #define ADS_POLL_US        10000u   /* RunImpl period: 10ms = 100Hz (matches sensor output rate) */
-#define ADS_RANGE_DEG      200.0f   /* Hard range check: rejects completely corrupted I2C reads */
+#define ADS_RANGE_DEG      900.0f   /* Hard range check: rejects completely corrupted I2C reads */
 #define ADS_MEDIAN_N       3        /* Median filter window size */
 
 class FlexSensor : public device::I2C, public I2CSPIDriver<FlexSensor>

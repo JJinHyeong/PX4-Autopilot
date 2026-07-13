@@ -585,6 +585,11 @@ void FlexSensor::diag()
 		PX4_INFO("  ── Result 0x%02X ──────────────────────────────────", SCAN_ADDRS[i]);
 		PX4_INFO("  good=%d  bad_pkt=%d  read_err=%d", good, bad_pkt, rd_err);
 
+		/* 물리 범위 초과 여부 확인 (±105° 기준) */
+		static constexpr float PHYS_LIMIT = 105.0f;
+		bool axis1_oor = fabsf((float)prev_r1 * ADS_SCALE_2AXIS) > PHYS_LIMIT;
+		bool axis2_oor = fabsf((float)prev_r2 * ADS_SCALE_2AXIS) > PHYS_LIMIT;
+
 		if (rd_err == 20) {
 			PX4_ERR("  FAIL: all reads failed after successful init");
 			PX4_ERR("        -> sensor entered auto-sleep?");
@@ -600,7 +605,19 @@ void FlexSensor::diag()
 			PX4_WARN("           -> workaround: RESET -> RUN only (skip SPS)");
 
 		} else {
-			PX4_INFO("  PASS: sensor working correctly");
+			PX4_INFO("  PASS: sensor responding correctly");
+		}
+
+		if (axis1_oor) {
+			PX4_WARN("  WARNING: Axis1 = %.1f deg exceeds physical limit (+-105 deg)",
+				 (double)((float)prev_r1 * ADS_SCALE_2AXIS));
+			PX4_WARN("           -> RunImpl range check WILL reject all samples");
+			PX4_WARN("           -> Possible cause: sensor overstressed or Axis1 element damaged");
+		}
+
+		if (axis2_oor) {
+			PX4_WARN("  WARNING: Axis2 = %.1f deg exceeds physical limit (+-105 deg)",
+				 (double)((float)prev_r2 * ADS_SCALE_2AXIS));
 		}
 	}
 
