@@ -648,6 +648,21 @@ int FlexSensor::set_device_addr(uint8_t new_addr)
 }
 
 /* ----------------------------------------------------------------
+ * factory_reset : 사용자 캘리브레이션 삭제 + 공장 캘리브레이션 복원
+ *
+ * ADS_CMD_CALIBRATE(0x07) + step=ADS_CAL_FACTORY_RESET(0x03) 전송.
+ * 초기화 후에도 평평한 자세에서 raw 값이 비정상적으로 크게 나오면
+ * (다른 정상 센서 대비 큰 오프셋) 사용자 캘리브레이션 문제가 아니라
+ * 하드웨어 손상(과도한 스트레인 등)일 가능성이 높다는 진단 기준으로
+ * 쓸 수 있다.
+ * ---------------------------------------------------------------- */
+int FlexSensor::factory_reset()
+{
+	uint8_t cmd[ADS_TX_SIZE] = {ADS_CMD_CALIBRATE, ADS_CAL_FACTORY_RESET};
+	return send_cmd(cmd, sizeof(cmd));
+}
+
+/* ----------------------------------------------------------------
  * run_shutdown_test : SHUTDOWN(0x09)이 ADC freeze를 해제하는지 검증
  *
  * 테스트 순서:
@@ -837,6 +852,11 @@ void FlexSensor::print_usage()
   flex_sensor zero   <- 현재 자세를 0도 기준으로 저장 (모든 센서 동시)
   param save         <- 재부팅 후에도 유지
 
+### [캘리브레이션 문제 진단]
+  다른 센서 대비 평평한 자세에서 raw 값이 비정상적으로 크면:
+  flex_sensor factory_reset -X -b 3 -a <addr>   <- 사용자 캘리브레이션 삭제, 공장값 복원
+  초기화 후에도 값이 안 돌아오면 하드웨어 손상(과도한 스트레인 등) 의심
+
 ### [실시간 데이터 확인]
   listener flex_sensor -i 0   # Sensor 1 [0x13]
   listener flex_sensor -i 1   # Sensor 2 [0x14]
@@ -853,6 +873,7 @@ void FlexSensor::print_usage()
 	PRINT_MODULE_USAGE_COMMAND_DESCR("zero", "Zero all sensors (run 'param save' to persist)");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("diag", "I2C bus scan + step-by-step init + 20-sample read test");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("set_addr", "Change I2C address (connect 1 sensor only)");
+	PRINT_MODULE_USAGE_COMMAND_DESCR("factory_reset", "Clear user calibration, restore factory calibration (connect 1 sensor only)");
 	PRINT_MODULE_USAGE_PARAM_FLAG('X', "External I2C bus", false);
 	PRINT_MODULE_USAGE_PARAM_INT('b', 3, 1, 4, "Bus number", false);
 	PRINT_MODULE_USAGE_PARAM_INT('a', 0x13, 0x08, 0x77, "Current address (auto-scan if omitted)", true);
@@ -958,6 +979,37 @@ extern "C" __EXPORT int flex_sensor_main(int argc, char *argv[])
 			PX4_INFO("Power cycle, then verify with 'i2cdetect -b %d'", config.bus);
 		} else {
 			PX4_ERR("Address change failed - check sensor connection");
+		}
+
+		delete dev;
+		return ret;
+
+	} else if (!strcmp(verb, "factory_reset")) {
+		if (!iterator.next()) {
+			PX4_ERR("No sensor found on bus - check wiring and connect only 1 sensor");
+			return -1;
+		}
+
+		I2CSPIDriverConfig config(cli, iterator, px4::wq_configurations::I2C1);
+		FlexSensor *dev = new FlexSensor(config);
+		int ret = dev->I2C::init();
+
+		if (ret != PX4_OK) {
+			PX4_ERR("Sensor not responding (bus %d addr 0x%02X) - check wiring",
+				config.bus, config.i2c_address);
+			delete dev;
+			return ret;
+		}
+
+		PX4_INFO("Sensor found: bus %d addr 0x%02X", config.bus, config.i2c_address);
+		ret = dev->factory_reset();
+		px4_usleep(10000);
+
+		if (ret == PX4_OK) {
+			PX4_INFO("Factory reset sent: user calibration cleared, factory calibration restored");
+			PX4_INFO("Check flat-position raw value with 'flex_sensor diag' or 'flex_sensor status'");
+		} else {
+			PX4_ERR("Factory reset failed - check sensor connection");
 		}
 
 		delete dev;

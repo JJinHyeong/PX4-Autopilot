@@ -86,6 +86,13 @@
 #define ADS_CMD_GET_DEV_ID 0x0Au  /* 디바이스 ID 요청: [0x0A, 0,0,0,0] → 5바이트 응답 */
 #define ADS_CMD_SET_ADDR   0x04u  /* I²C 주소 변경: [0x04, new_addr, 0, 0, 0] → 센서 플래시에 영구 저장 */
 #define ADS_CMD_SHUTDOWN   0x09u  /* 초저전력 대기: ~50nA, RESET으로만 복귀 가능 */
+#define ADS_CMD_CALIBRATE  0x07u  /* 캘리브레이션: [0x07, step, angle, 0, 0] */
+
+/* ADS_CMD_CALIBRATE의 step 파라미터 (buf[1]) */
+#define ADS_CAL_STEP_ZERO      0x00u  /* 0단계: 두 축 모두 0° 기준점 */
+#define ADS_CAL_STEP_FLAT      0x01u  /* 1단계: flat axis 보정 (angle=buf[2], 권장 90°) */
+#define ADS_CAL_STEP_PERP      0x02u  /* 2단계: perpendicular axis 보정 (angle=buf[2], 권장 90°) */
+#define ADS_CAL_FACTORY_RESET  0x03u  /* 사용자 캘리브레이션 삭제, 공장 캘리브레이션 복원 */
 
 /* ================================================================
  * 응답 패킷 타입 (수신 데이터의 buf[0])
@@ -138,6 +145,9 @@ public:
 	void RunImpl();
 	void print_status() override;
 	int  set_device_addr(uint8_t new_addr);
+
+	/* 사용자 캘리브레이션 삭제 + 공장 캘리브레이션 복원 (ADS_CMD_CALIBRATE step=0x03) */
+	int  factory_reset();
 
 	/* 영점 요청: flex_sensor zero 명령에서 호출 */
 	static void request_zero() { _zero_mask = 0x0F; }
